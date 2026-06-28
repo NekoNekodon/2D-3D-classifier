@@ -64,7 +64,7 @@ def safe_pil_loader(path):
     except (OSError, IOError, Exception) as e:
         # Catch exceptions and notify corrupted file
         error_msg = str(e)[:50]
-        print(f"⚠️ Corrupted image detected: {path} | Error: {error_msg}")
+        print(f" Corrupted image detected: {path} | Error: {error_msg}")
 
 # Custom safe ImageFolder class
 class SafeImageFolder(datasets.ImageFolder):
@@ -78,7 +78,7 @@ class SafeImageFolder(datasets.ImageFolder):
         try:
             return super().__getitem__(index)
         except Exception as e:
-            print(f"⚠️ Failed to process image (index {index}) | Error: {str(e)[:50]}")
+            print(f" Failed to process image (index {index}) | Error: {str(e)[:50]}")
             # Return blank black image and invalid label
             img = Image.new("RGB", TARGET_SIZE, color=(0, 0, 0))
             if self.transform:
@@ -114,7 +114,7 @@ def load_dataset(data_dir, train_transform, val_transform, val_split=0.2):
 
     # Empty dataset check
     if len(full_dataset) == 0:
-        raise ValueError("❌ Dataset is empty, check DATA_DIR path")
+        raise ValueError(" Dataset is empty, check DATA_DIR path")
 
     # Get sample indices and labels
     indices = list(range(len(full_dataset)))
@@ -157,7 +157,7 @@ def load_dataset(data_dir, train_transform, val_transform, val_split=0.2):
     idx_to_class = {v: k for k, v in class_to_idx.items()}
 
     # Print class distribution stats
-    print("📊 Stratified class distribution:")
+    print(" Stratified class distribution:")
     train_labels = [labels[i] for i in train_idx]
     val_labels = [labels[i] for i in val_idx]
     for idx, cls in idx_to_class.items():
@@ -257,11 +257,11 @@ if __name__ == "__main__":
 
     try:
         # Load dataset
-        print("\n📥 Loading dataset...")
+        print("\n Loading dataset...")
         train_loader, val_loader, idx_to_class = load_dataset(
             DATA_DIR, train_transform, val_transform, VAL_SPLIT
         )
-        print(f"✅ Dataset loaded successfully:")
+        print(f" Dataset loaded successfully:")
         print(f"   - Train batches: {len(train_loader)} ({len(train_loader.dataset)} total images)")
         print(f"   - Val batches: {len(val_loader)} ({len(val_loader.dataset)} total images)")
         print(f"   - Class labels: {idx_to_class}")
@@ -283,7 +283,7 @@ if __name__ == "__main__":
 
         # Start training loop
         best_val_acc = 0.0
-        print(f"\n🚀 Start training on {DEVICE} ...")
+        print(f"\n Start training on {DEVICE} ...")
 
         for epoch in range(EPOCHS):
             # Train step
@@ -330,7 +330,7 @@ if __name__ == "__main__":
                     keep_initializers_as_inputs=False,
                 )
 
-                print(f"📌 Saved best model (Val Acc: {best_val_acc:.2f}%) → {onnx_path}")
+                print(f" Saved best model (Val Acc: {best_val_acc:.2f}%) → {onnx_path}")
 
         # Export label mapping json
         label_map_path = os.path.join(SAVE_DIR, "label_map.json")
@@ -338,13 +338,13 @@ if __name__ == "__main__":
             json.dump(idx_to_class, f, ensure_ascii=False, indent=2)
 
         # Training finished prompt
-        print(f"\n✅ Training completed!")
+        print(f"\n Training completed!")
         print(f"   - Best validation accuracy: {best_val_acc:.2f}%")
         print(f"   - Model save directory: {SAVE_DIR}")
         print(f"   - Label mapping file: {label_map_path}")
 
     except Exception as e:
-        print(f"\n❌ Training runtime error: {e}")
+        print(f"\n Training runtime error: {e}")
         raise
     finally:
         writer.close()
