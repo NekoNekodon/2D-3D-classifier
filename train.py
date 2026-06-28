@@ -15,13 +15,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
 # ===================== 0. Global Config & Fixes =====================
-# Suppress PIL warnings (corrupted EXIF data etc.)
+# Suppress PIL warnings (corrupted EXIF data)
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 # Fix PIL loading truncated images
 os.environ["PIL_IMAGEIO_IGNORE_TRUNCATED_IMAGES"] = "1"
 os.environ["PIL_PNG_SUPPORT_TRUNCATED_IMAGES"] = "1"
 
-# ===================== 1. Core Configuration (Modify as needed) =====================
+# ===================== 1. Core Configuration  =====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Auto detect GPU/CPU
 BATCH_SIZE = 256  # Small batch size to reduce memory usage
 EPOCHS = 15  # 10-20 epochs recommended for small datasets
@@ -50,7 +50,7 @@ if torch.cuda.is_available():
 # ├─ 3d/    # 3D/real human photos
 # └─ other/ # Text-dominant images
 
-# ===================== 2. Safe Image Loader (Core Fix) =====================
+# ===================== 2. Safe Image Loader =====================
 def safe_pil_loader(path):
     """Safe image loader to handle corrupted/truncated images"""
     try:
@@ -106,7 +106,7 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ===================== 4. Dataset Loading (Optimized) =====================
+# ===================== 4. Dataset Loading  =====================
 def load_dataset(data_dir, train_transform, val_transform, val_split=0.2):
     """Load dataset and split train/val with stratified sampling"""
     # Load dataset with safe ImageFolder
