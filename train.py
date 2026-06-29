@@ -4,91 +4,44 @@ import json
 import torch
 import numpy as np
 import random
-import warnings
 import torch.nn as nn
 import torch.optim as optim
-from PIL import Image
+from torch.cuda.amp import autocast, GradScaler
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
 
-# ===================== 0. Global Config & Fixes =====================
-# Suppress PIL warnings (corrupted EXIF data)
-warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
-# Fix PIL loading truncated images
-os.environ["PIL_IMAGEIO_IGNORE_TRUNCATED_IMAGES"] = "1"
-os.environ["PIL_PNG_SUPPORT_TRUNCATED_IMAGES"] = "1"
+# ===================== 1. 核心配置（按需修改） =====================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 600
+EPOCHS = 15
+LEARNING_RATE = 0.001
+DATA_DIR = "../dataset_256_stretch"
+SAVE_DIR = "../models"
+TARGET_SIZE = (256, 256)
+VAL_SPLIT = 0.2
+EARLY_STOP_PATIENCE = 5  # 早停轮数
+WARMUP_EPOCHS = 2
+USE_AMP = torch.cuda.is_available()  # GPU自动开启混合精度
 
-# ===================== 1. Core Configuration  =====================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Auto detect GPU/CPU
-BATCH_SIZE = 256  # Small batch size to reduce memory usage
-EPOCHS = 15  # 10-20 epochs recommended for small datasets
-LEARNING_RATE = 0.001  # Learning rate
-DATA_DIR = "../dataset"  # Root directory of dataset
-SAVE_DIR = "../models"  # Model output directory
-TARGET_SIZE = (300, 300)  # Model input resolution
-VAL_SPLIT = 0.1  # Validation set ratio (10%)
-NUM_WORKERS = 0  # Set to 0 on Windows to avoid multiprocessing errors
+# CenterLoss超参
+LAMBDA_CENTER = 0.1
+hidden_dim = 256
 
-# Fix random seeds for reproducibility
+# 固定随机种子保证可复现
 torch.manual_seed(42)
-torch.cuda.manual_seed(42) if torch.cuda.is_available() else None
+torch.cuda.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
-
-# CUDA performance optimization
 if torch.cuda.is_available():
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
 
-# Dataset folder structure
-# dataset/
-# ├─ 2d/    # 2D character illustrations
-# ├─ 3d/    # 3D/real human photos
-# └─ other/ # Text-dominant images
-
-# ===================== 2. Safe Image Loader =====================
-def safe_pil_loader(path):
-    """Safe image loader to handle corrupted/truncated images"""
-    try:
-        with Image.open(path) as img:
-            # Force full image data loading
-            img.load()
-            # Convert to RGB (handle grayscale / transparent images)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            return img
-    except (OSError, IOError, Exception) as e:
-        # Catch exceptions and notify corrupted file
-        error_msg = str(e)[:50]
-        print(f" Corrupted image detected: {path} | Error: {error_msg}")
-
-# Custom safe ImageFolder class
-class SafeImageFolder(datasets.ImageFolder):
-    def __init__(self, root, transform=None, target_transform=None):
-        super().__init__(root, transform=transform, target_transform=target_transform)
-        # Replace default loader with safe loader
-        self.loader = safe_pil_loader
-
-    def __getitem__(self, index):
-        """Override getitem with exception handling"""
-        try:
-            return super().__getitem__(index)
-        except Exception as e:
-            print(f" Failed to process image (index {index}) | Error: {str(e)[:50]}")
-            # Return blank black image and invalid label
-            img = Image.new("RGB", TARGET_SIZE, color=(0, 0, 0))
-            if self.transform:
-                img = self.transform(img)
-            return img, 0
-
-# ===================== 3. Data Preprocessing =====================
-# Train set transforms (light augmentation)
+# ===================== 2. 数据预处理 =====================
 train_transform = transforms.Compose([
-    transforms.Resize(TARGET_SIZE),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomRotation(15),
     transforms.RandomResizedCrop(TARGET_SIZE, scale=(0.8, 1.0)),
@@ -96,255 +49,324 @@ train_transform = transforms.Compose([
     transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
     transforms.ColorJitter(brightness=0.23, contrast=0.3, saturation=0.2),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2))
 ])
 
-# Validation set transforms (no augmentation)
 val_transform = transforms.Compose([
-    transforms.Resize(TARGET_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ===================== 4. Dataset Loading  =====================
-def load_dataset(data_dir, train_transform, val_transform, val_split=0.2):
-    """Load dataset and split train/val with stratified sampling"""
-    # Load dataset with safe ImageFolder
-    full_dataset = SafeImageFolder(data_dir, transform=train_transform)
+# ===================== 3. 分层数据集加载 & CenterLoss定义 =====================
+class DatasetWithTransform(torch.utils.data.Dataset):
+    def __init__(self, dataset, indices, transform):
+        self.dataset = dataset
+        self.indices = indices
+        self.transform = transform
 
-    # Empty dataset check
-    if len(full_dataset) == 0:
-        raise ValueError(" Dataset is empty, check DATA_DIR path")
+    def __getitem__(self, idx):
+        img, label = self.dataset[self.indices[idx]]
+        if self.transform:
+            img = self.transform(img)
+        return img, label
 
-    # Get sample indices and labels
+    def __len__(self):
+        return len(self.indices)
+
+class CenterLoss(nn.Module):
+    def __init__(self, num_classes, feat_dim, device):
+        super(CenterLoss, self).__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.device = device
+        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim).to(device))
+
+    def forward(self, features, labels):
+        batch_size = features.shape[0]
+        centers_batch = self.centers[labels]
+        dist = torch.sum((features - centers_batch) ** 2, dim=1)
+        loss = torch.sum(dist) / (2.0 * batch_size)
+        return loss
+
+def load_dataset(data_dir, train_transform, val_transform, val_split):
+    full_dataset = datasets.ImageFolder(data_dir)
     indices = list(range(len(full_dataset)))
-    labels = [full_dataset.targets[i] for i in indices]
+    all_labels = full_dataset.targets
 
-    # Stratified split
     train_idx, val_idx = train_test_split(
         indices,
         test_size=val_split,
-        stratify=labels,
+        stratify=all_labels,
         random_state=42
     )
 
-    # Create train subset with train augmentation
-    train_dataset = Subset(full_dataset, train_idx)
+    train_dataset = DatasetWithTransform(full_dataset, train_idx, train_transform)
+    val_dataset = DatasetWithTransform(full_dataset, val_idx, val_transform)
 
-    # Create validation subset with val transforms
-    val_dataset = Subset(SafeImageFolder(data_dir, transform=val_transform), val_idx)
+    if os.name == "nt":
+        num_workers = 0
+    else:
+        num_workers = min(8, os.cpu_count() // 2)
 
-    # Build dataloaders
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True if torch.cuda.is_available() else False,
-        drop_last=True  # Discard incomplete last batch
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
     )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True if torch.cuda.is_available() else False
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
     )
 
-    # Class label mapping
     class_to_idx = full_dataset.class_to_idx
     idx_to_class = {v: k for k, v in class_to_idx.items()}
+    num_classes = len(class_to_idx)
 
-    # Print class distribution stats
-    print(" Stratified class distribution:")
-    train_labels = [labels[i] for i in train_idx]
-    val_labels = [labels[i] for i in val_idx]
-    for idx, cls in idx_to_class.items():
-        train_count = train_labels.count(idx)
-        val_count = val_labels.count(idx)
-        print(f"   - {cls}: Train {train_count} | Val {val_count}")
+    print("📊 分层后类别分布：")
+    train_labels = [all_labels[i] for i in train_idx]
+    val_labels = [all_labels[i] for i in val_idx]
+    for cls_id, cls_name in idx_to_class.items():
+        train_cnt = train_labels.count(cls_id)
+        val_cnt = val_labels.count(cls_id)
+        print(f"   - {cls_name}：训练集{train_cnt}张 | 验证集{val_cnt}张")
 
-    return train_loader, val_loader, idx_to_class
+    return train_loader, val_loader, idx_to_class, num_classes, train_labels
 
-# ===================== 5. Model Construction =====================
-def build_model(num_classes=3):
-    """Build lightweight classification model (EfficientNet-V2-S)"""
-    # Load pretrained weights
-    model = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
 
-    # Freeze backbone feature layers
+train_loader, val_loader, idx_to_class, num_classes, train_label_list = load_dataset(
+    DATA_DIR, train_transform, val_transform, VAL_SPLIT
+)
+print(f"✅ 数据集加载完成：")
+print(f"   - 训练集批次：{len(train_loader)} (共{len(train_loader.dataset)}张)")
+print(f"   - 验证集批次：{len(val_loader.dataset)} (共{len(val_loader.dataset)}张)")
+print(f"   - 分类标签：{idx_to_class}")
+print(f"   - 类别数：{num_classes}")
+
+# 二分类权重：0=2D，1=3D（小众类别权重加高）
+weights = np.array([1.0, 2.0])
+class_weights = torch.FloatTensor(weights).to(DEVICE)
+print(f"⚖️ 类别权重：{class_weights.cpu().numpy()}")
+
+# ===================== 4. 模型构建（二分类） =====================
+def build_model(num_classes=2):
+    from torchvision.models import MobileNet_V2_Weights
+    model = models.mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
     for param in model.parameters():
         param.requires_grad = False
 
-    # Replace classification head
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.2),  # Dropout to mitigate overfitting
-        nn.Linear(in_features, num_classes)
+    in_dim = model.last_channel
+
+    model.features_out = nn.Sequential(
+        nn.Dropout(0.2),
+        nn.Linear(in_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.3),
     )
+    model.class_head = nn.Linear(hidden_dim, num_classes)
 
-    # Move model to target device
-    model = model.to(DEVICE)
-    return model
+    def new_forward(x):
+        x = model.features(x)
+        x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
+        feat = model.features_out(x)
+        logits = model.class_head(feat)
+        return feat, logits
 
-# ===================== 6. Train & Validation Functions =====================
-def train_one_epoch(model, train_loader, criterion, optimizer, epoch):
-    """Train single epoch"""
+    model.forward = new_forward
+    return model.to(DEVICE)
+
+model = build_model(num_classes=2)
+scaler = GradScaler() if USE_AMP else None
+
+criterion_ce = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+criterion_center = CenterLoss(num_classes=2, feat_dim=hidden_dim, device=DEVICE)
+
+trainable_params = list(filter(lambda p: p.requires_grad, model.parameters())) + list(criterion_center.parameters())
+optimizer = optim.AdamW(
+    trainable_params,
+    lr=LEARNING_RATE,
+    weight_decay=1e-4
+)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+# ===================== 5. 训练&验证函数（修复二分类AUC报错） =====================
+def train_one_epoch(model, loader, ce_loss_fn, center_loss_fn, optimizer, scaler, epoch):
     model.train()
-    total_loss = 0.0
+    total_total_loss = 0.0
+    total_ce = 0.0
+    total_center = 0.0
     correct = 0
     total = 0
 
-    for batch_idx, (inputs, labels) in enumerate(train_loader):
+    for batch_idx, (inputs, labels) in enumerate(loader):
         inputs, labels = inputs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-
-        # Forward pass
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
 
-        # Backward pass & optimize
-        loss.backward()
-        optimizer.step()
+        if USE_AMP:
+            with autocast():
+                feat, logits = model(inputs)
+                ce_l = ce_loss_fn(logits, labels)
+                center_l = center_loss_fn(feat, labels)
+                loss = ce_l + LAMBDA_CENTER * center_l
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError(f"[Epoch {epoch}] Batch {batch_idx} Loss is NaN/Inf, stop training!")
+            scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(center_loss_fn.parameters(), max_norm=0.01)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            feat, logits = model(inputs)
+            ce_l = ce_loss_fn(logits, labels)
+            center_l = center_loss_fn(feat, labels)
+            loss = ce_l + LAMBDA_CENTER * center_l
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError(f"[Epoch {epoch}] Batch {batch_idx} Loss is NaN/Inf, stop training!")
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(center_loss_fn.parameters(), max_norm=0.01)
+            optimizer.step()
 
-        # Statistics
-        total_loss += loss.item()
-        _, predicted = torch.max(outputs.data, 1)
+        total_total_loss += loss.item()
+        total_ce += ce_l.item()
+        total_center += center_l.item()
+        _, predicted = torch.max(logits.data, 1)
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
 
-        # Print batch log every 5 batches
         if batch_idx % 5 == 0:
-            print(f"Epoch [{epoch + 1}/{EPOCHS}] Batch [{batch_idx}/{len(train_loader)}] "
-                  f"Loss: {loss.item():.4f} "
-                  f"Acc: {100. * correct / total:.2f}%")
+            batch_acc = 100. * correct / total
+            print(
+                f"Epoch [{epoch + 1}/{EPOCHS}] Batch [{batch_idx}/{len(loader)}] "
+                f"TotalLoss: {loss.item():.4f} CE:{ce_l.item():.4f} Center:{center_l.item():.4f} Acc: {batch_acc:.2f}%"
+            )
 
-    avg_loss = total_loss / len(train_loader)
+    avg_total = total_total_loss / len(loader)
+    avg_ce = total_ce / len(loader)
+    avg_center = total_center / len(loader)
     train_acc = 100. * correct / total
-    return avg_loss, train_acc
+    return avg_total, avg_ce, avg_center, train_acc
 
-def validate(model, val_loader, criterion):
-    """Run validation on dataset"""
+
+def validate(model, loader, ce_loss_fn):
     model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    total_ce_loss = 0.0
+    all_labels = []
+    all_probs = []
+    all_preds = []
 
     with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs, labels = inputs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            feat, logits = model(inputs)
+            loss = ce_loss_fn(logits, labels)
+            total_ce_loss += loss.item()
 
-            total_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            all_labels.extend(labels.cpu().numpy())
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            all_probs.extend(probs)
+            _, predicted = torch.max(logits.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
 
-    avg_loss = total_loss / len(val_loader)
-    val_acc = 100. * correct / total
-    print(f"===== Validation Loss: {avg_loss:.4f} | Validation Acc: {val_acc:.2f}% =====")
-    return avg_loss, val_acc
+    avg_loss = total_ce_loss / len(loader)
+    y_true = np.array(all_labels)
+    y_prob = np.array(all_probs)
+    val_acc = 100. * np.sum(np.array(all_preds) == y_true) / len(y_true)
 
-# ===================== 7. Main Training Pipeline =====================
-if __name__ == "__main__":
-    # Create model save directory
-    os.makedirs(SAVE_DIR, exist_ok=True)
-
-    # Initialize tensorboard logger
-    writer = SummaryWriter("runs/train_log")
-
+    # 二分类专用：取正类(1)概率，一维输入，消除shape报错
+    pos_prob = y_prob[:, 1]
+    val_roc_auc = 0.0
     try:
-        # Load dataset
-        print("\n Loading dataset...")
-        train_loader, val_loader, idx_to_class = load_dataset(
-            DATA_DIR, train_transform, val_transform, VAL_SPLIT
+        val_roc_auc = roc_auc_score(y_true, pos_prob)
+    except ValueError as e:
+        print(f"⚠️ ROC-AUC计算失败：{str(e)}")
+        unique_val_label = set(y_true)
+        print(f"当前验证集仅包含类别：{sorted(unique_val_label)}，存在类别样本缺失")
+
+    # PR-AUC 仅关注正类3D图
+    precision, recall, _ = precision_recall_curve(y_true, pos_prob)
+    val_pr_auc = auc(recall, precision)
+
+    print(f"Class 0(2D) / Class 1(3D) PR-AUC: {val_pr_auc:.4f}")
+    print(f"===== Val CE Loss: {avg_loss:.4f} | Val Acc: {val_acc:.2f}% | ROC-AUC: {val_roc_auc:.4f} | PR-AUC: {val_pr_auc:.4f} =====")
+    return avg_loss, val_acc, val_roc_auc, val_pr_auc
+
+# ===================== 6. 主训练入口 =====================
+if __name__ == "__main__":
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    writer = SummaryWriter("runs/train_log")
+    best_pr_auc = 0.0
+    early_stop_count = 0
+
+    print(f"\n🚀 开始训练，设备：{DEVICE.type} | AMP混合精度：{USE_AMP}")
+    for epoch in range(EPOCHS):
+        train_total_loss, train_ce_loss, train_center_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion_ce, criterion_center, optimizer, scaler, epoch
         )
-        print(f" Dataset loaded successfully:")
-        print(f"   - Train batches: {len(train_loader)} ({len(train_loader.dataset)} total images)")
-        print(f"   - Val batches: {len(val_loader)} ({len(val_loader.dataset)} total images)")
-        print(f"   - Class labels: {idx_to_class}")
-        print(f"   - Running device: {DEVICE}")
+        val_loss, val_acc, val_roc_auc, val_pr_auc = validate(model, val_loader, criterion_ce)
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        # Initialize model
-        print("\n🔧 Initializing model...")
-        model = build_model(num_classes=len(idx_to_class))
+        writer.add_scalar("LR/lr", current_lr, epoch)
+        writer.add_scalar("Loss/Train_Total", train_total_loss, epoch)
+        writer.add_scalar("Loss/Train_CE", train_ce_loss, epoch)
+        writer.add_scalar("Loss/Train_Center", train_center_loss, epoch)
+        writer.add_scalar("Acc/Train", train_acc, epoch)
+        writer.add_scalar("Loss/Val_CE", val_loss, epoch)
+        writer.add_scalar("Acc/Val", val_acc, epoch)
+        writer.add_scalar("Metric/Val_ROC_AUC", val_roc_auc, epoch)
+        writer.add_scalar("Metric/Val_PR_AUC", val_pr_auc, epoch)
 
-        # Loss function & optimizer
-        class_weights = torch.FloatTensor([1.2, 1.2, 1.8]).to(DEVICE)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        optimizer = optim.AdamW(
-            model.classifier.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=1e-4
-        )
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+        if val_pr_auc > best_pr_auc and val_pr_auc > 1e-6:
+            best_pr_auc = val_pr_auc
+            early_stop_count = 0
+            ckpt_path = os.path.join(SAVE_DIR, "checkpoint.pth")
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "center_state_dict": criterion_center.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_pr_auc": best_pr_auc,
+                "loss": val_loss
+            }, ckpt_path)
+            torch.save(model.state_dict(), os.path.join(SAVE_DIR, "best_model.pth"))
 
-        # Start training loop
-        best_val_acc = 0.0
-        print(f"\n Start training on {DEVICE} ...")
+            class InferWrapper(nn.Module):
+                def __init__(self, net):
+                    super().__init__()
+                    self.net = net
+                def forward(self, x):
+                    _, log = self.net(x)
+                    return log
+            infer_model = InferWrapper(model)
+            infer_model.eval()
 
-        for epoch in range(EPOCHS):
-            # Train step
-            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, epoch)
-
-            # Validation step
-            val_loss, val_acc = 0.0, 0.0
-            if len(val_loader) > 0:
-                val_loss, val_acc = validate(model, val_loader, criterion)
-
-            # Update learning rate scheduler
-            scheduler.step()
-
-            # Write tensorboard logs
-            writer.add_scalar("Loss/Train", train_loss, epoch)
-            writer.add_scalar("Acc/Train", train_acc, epoch)
-            writer.add_scalar("Loss/Val", val_loss, epoch)
-            writer.add_scalar("Acc/Val", val_acc, epoch)
-            writer.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], epoch)
-
-            # Save best model checkpoint
-            if val_acc > best_val_acc and len(val_loader) > 0:
-                best_val_acc = val_acc
-                # Save PyTorch checkpoint
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_val_acc': best_val_acc,
-                    'label_map': idx_to_class
-                }, os.path.join(SAVE_DIR, "best_model.pth"))
-
-                # Export ONNX model
-                dummy_input = torch.randn(1, 3, TARGET_SIZE[0], TARGET_SIZE[1]).to(DEVICE)
-                onnx_path = os.path.join(SAVE_DIR, "classifier.onnx")
-
+            dummy_input = torch.randn(1, 3, TARGET_SIZE[0], TARGET_SIZE[1]).to(DEVICE)
+            onnx_path = os.path.join(SAVE_DIR, "classifier.onnx")
+            with torch.no_grad():
                 torch.onnx.export(
-                    model, dummy_input, onnx_path,
+                    infer_model, dummy_input, onnx_path,
                     input_names=["input"], output_names=["output"],
                     opset_version=18,
                     verbose=False,
                     export_params=True,
-                    do_constant_folding=True,
-                    keep_initializers_as_inputs=False,
+                    do_constant_folding=True
                 )
+            print(f"📌 新最优模型保存 | Best PR-AUC={best_pr_auc:.4f} → {onnx_path}")
+        else:
+            early_stop_count += 1
+            print(f"⏸️ PR-AUC未提升，早停计数：{early_stop_count}/{EARLY_STOP_PATIENCE}")
+            if early_stop_count >= EARLY_STOP_PATIENCE:
+                print(f"🛑 连续{EARLY_STOP_PATIENCE}轮PR-AUC无提升，触发早停，终止训练")
+                break
 
-                print(f" Saved best model (Val Acc: {best_val_acc:.2f}%) → {onnx_path}")
+    label_map_path = os.path.join(SAVE_DIR, "label_map.json")
+    with open(label_map_path, "w", encoding="utf-8") as f:
+        json.dump(idx_to_class, f, ensure_ascii=False, indent=2)
 
-        # Export label mapping json
-        label_map_path = os.path.join(SAVE_DIR, "label_map.json")
-        with open(label_map_path, "w", encoding="utf-8") as f:
-            json.dump(idx_to_class, f, ensure_ascii=False, indent=2)
-
-        # Training finished prompt
-        print(f"\n Training completed!")
-        print(f"   - Best validation accuracy: {best_val_acc:.2f}%")
-        print(f"   - Model save directory: {SAVE_DIR}")
-        print(f"   - Label mapping file: {label_map_path}")
-
-    except Exception as e:
-        print(f"\n Training runtime error: {e}")
-        raise
-    finally:
-        writer.close()
+    writer.close()
+    print("\n==================== 训练结束 ====================")
+    print(f"🏆 全局最优验证PR-AUC：{best_pr_auc:.4f}")
+    print(f"📁 模型输出目录：{SAVE_DIR}")
+    print(f"📄 类别映射文件：{label_map_path}")
+    print(f"✅ checkpoint.pth、best_model.pth、classifier.onnx 已全部生成")
